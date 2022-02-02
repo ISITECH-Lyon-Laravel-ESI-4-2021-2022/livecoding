@@ -1,0 +1,283 @@
+name: CI/CD
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+on:
+#  schedule:
+#    - cron: '26 4 * * *'
+  push:
+    branches: [ main ]
+    # Publish semver tags as releases.
+    tags: [ 'v*.*.*' ]
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: rg.fr-par.scw.cloud/isitech-lyon-laravel-esi-4-2021-2022
+
+
+jobs:
+  check-env:
+    runs-on: [ self-hosted ]
+    outputs:
+      deploy-allowed: ${{ steps.deploy-allowed.outputs.defined }}
+    steps:
+      - id: deploy-allowed
+        env:
+          DEPLOY: ${{ secrets.DEPLOY }}
+        if: "${{ env.DEPLOY != '' }}"
+        run: echo "::set-output name=defined::true"
+
+  build:
+    runs-on: [self-hosted]
+    needs: [ check-env ]
+    if: needs.check-env.outputs.deploy-allowed == 'true'
+    permissions:
+      contents: read
+      packages: write
+      # This is used to complete the identity challenge
+      # with sigstore/fulcio when running outside of PRs.
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Inject slug/short variables
+        uses: rlespinasse/github-slug-action@v4
+
+      - name: Copy .env
+        run: cp .env.example .env
+
+#      - name: Directory Permissions
+#        run: chmod -R 777 storage bootstrap/cache
+
+#      - name: Install Dependencies
+#        run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+
+      # Install the cosign tool except on PR
+      # https://github.com/sigstore/cosign-installer
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@1e95c1de343b5b0c23352d6417ee3e48d5bcd422
+        with:
+          cosign-release: 'v1.4.0'
+
+      # Workaround: https://github.com/docker/build-push-action/issues/461
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@79abd3f86f79a9d68a23c75a09a9a85889262adf
+        with:
+          driver: docker
+
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@28218f9b04b4f3f62068d7b6ce6ca5b26e35336c
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: nologin
+          password: ${{ secrets.SCALEWAY_TOKEN }}
+
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@98669ae865ea3cffbcbaa878cf57c20bbf1c6c38
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }}
+
+      - name: Display infos
+        run: echo ${{ env.REGISTRY }}/${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }}:${{ env.GITHUB_REF_SLUG_URL }}
+
+      # Build and push Docker image with Buildx (don't push on PR)
+      # https://github.com/docker/build-push-action
+      - name: Build Base Docker image
+        id: build-base
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        with:
+          context: ./docker/8.1
+          push: false
+          tags: sail-8.1/app:latest
+          build-args: |
+            WWWGROUP=1000
+
+      # Build and push Docker image with Buildx (don't push on PR)
+      # https://github.com/docker/build-push-action
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GITHUB_TOKEN=${{ secrets.COMPOSER_TOKEN }}
+
+  deploy:
+    needs: [ check-env, build ]
+    if: needs.check-env.outputs.deploy-allowed == 'true'
+    runs-on: [self-hosted]
+    permissions:
+      contents: read
+      packages: write
+      # This is used to complete the identity challenge
+      # with sigstore/fulcio when running outside of PRs.
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Inject slug/short variables
+        uses: rlespinasse/github-slug-action@v4
+
+      - name: Kubectl tool installer
+        uses: Azure/setup-kubectl@v2.0
+
+      - name: Check version
+        run: kubectl version --client=true
+
+      - name: Set cluster server
+        run: kubectl config set-cluster k8s --server="${{ secrets.KUBE_URL }}"
+
+      - name: Set cluster cert
+        run: kubectl config set-cluster k8s --embed-certs --certificate-authority <(echo ${{ secrets.KUBE_CERT }} | base64 --decode)
+
+      - name: Set Token
+        run: kubectl config set-credentials scaleway --token="${{ secrets.KUBE_TOKEN }}"
+
+      - name: Set User
+        run: kubectl config set-context default --cluster=k8s --user=scaleway
+
+      - name: Set default context
+        run: kubectl config use-context default
+
+      - name: Check version for both
+        run: kubectl version
+
+      - name: List nodes
+        run: kubectl get nodes
+
+#      - name: Extract repo name
+#        run: |
+#          export KUBE_NAMESPACE=$(echo '${{ github.repository }}' | awk -F '/' '{print $2}')
+#          echo "REPOSITORY_NAME=$(echo $KUBE_NAMESPACE)" >> $GITHUB_ENV
+#          echo "KUBE_NAMESPACE=$(echo $KUBE_NAMESPACE)" >> $GITHUB_ENV
+#        shell: bash
+
+      - name: Create namespace
+        run: kubectl create namespace ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} || true
+
+      - name: Register docker secret
+        env:
+          CI_REGISTRY: ${{ env.REGISTRY }}
+          REGISTRY_DEPLOY_USER: "nologin"
+          REGISTRY_DEPLOY_PASSWORD: ${{ secrets.SCALEWAY_TOKEN }}
+        run: |
+          kubectl create -n ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} \
+            secret docker-registry registry-scaleway-key \
+            --docker-server=$CI_REGISTRY \
+            --docker-username=$REGISTRY_DEPLOY_USER \
+            --docker-password=$REGISTRY_DEPLOY_PASSWORD \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Generate or retrieve passwords
+        run: |
+          export DB_ROOT_PASSWORD=$(kubectl get secret --namespace ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} ${{ env.GITHUB_REF_SLUG_URL }}-mysql -o jsonpath="{.data.mysql-root-password}" | base64 -d)
+          if [ -z "$DB_ROOT_PASSWORD" ]; then
+            export DB_ROOT_PASSWORD=$(openssl rand -base64 12);
+            echo "Generating new root mysql password";
+          fi
+          echo "::add-mask::$DB_ROOT_PASSWORD"
+          echo "DB_ROOT_PASSWORD=$DB_ROOT_PASSWORD" >> $GITHUB_ENV
+
+          export DB_PASSWORD=$(kubectl get secret --namespace ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} ${{ env.GITHUB_REF_SLUG_URL }}-mysql -o jsonpath="{.data.mysql-password}" | base64 -d)
+          if [ -z "$DB_PASSWORD" ]; then
+            export DB_PASSWORD=$(openssl rand -base64 12);
+            echo "Generating new mysql password";
+          fi
+          echo "::add-mask::$DB_PASSWORD"
+          echo "DB_PASSWORD=$DB_PASSWORD" >> $GITHUB_ENV
+
+          export REDIS_PASSWORD=$(kubectl get secret --namespace ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} ${{ env.GITHUB_REF_SLUG_URL }}-redis -o jsonpath="{.data.redis-password}" | base64 -d)
+          if [ -z "$REDIS_PASSWORD" ]; then
+            export REDIS_PASSWORD=$(openssl rand -base64 12);
+            echo "Generating new redis password";
+          fi
+          echo "::add-mask::$REDIS_PASSWORD"
+          echo "REDIS_PASSWORD=$REDIS_PASSWORD" >> $GITHUB_ENV
+
+          export MINIO_ACCESS_KEY_ID=$(kubectl get secret --namespace ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} ${{ env.GITHUB_REF_SLUG_URL }}-minio -o jsonpath="{.data.access-key}" | base64 -d)
+          if [ -z "$MINIO_ACCESS_KEY_ID" ]; then
+            export MINIO_ACCESS_KEY_ID=$(openssl rand -hex 12);
+            echo "Generating new minio access key";
+          fi
+          echo "::add-mask::$MINIO_ACCESS_KEY_ID"
+          echo "MINIO_ACCESS_KEY_ID=$MINIO_ACCESS_KEY_ID" >> $GITHUB_ENV
+
+          export MINIO_SECRET_KEY_ID=$(kubectl get secret --namespace ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} ${{ env.GITHUB_REF_SLUG_URL }}-minio -o jsonpath="{.data.secret-key}" | base64 -d)
+          if [ -z "$MINIO_SECRET_KEY_ID" ]; then
+            export MINIO_SECRET_KEY_ID=$(openssl rand -hex 40);
+            echo "Generating new minio secret key";
+          fi
+          echo "::add-mask::$MINIO_SECRET_KEY_ID"
+          echo "MINIO_SECRET_KEY_ID=$MINIO_SECRET_KEY_ID" >> $GITHUB_ENV
+
+      - name: Patch default docker secret
+        run: |
+          kubectl patch \
+            -n ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} \
+            serviceaccount default \
+            -p '{"imagePullSecrets": [{"name": "registry-scaleway-key"}]}'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v1
+
+      - name: Check helm version
+        run: helm version
+
+      - name: Deploy to kubernetes
+        env:
+          KUBE_REVIEW_URL: ${{ env.GITHUB_REF_SLUG_URL }}-${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }}.isitech.tancou.fr
+          DEV_APP_KEY: ${{ secrets.DEV_APP_KEY }}
+        run: |
+          cd deploy
+          helm dependency update
+          ls -lash ./charts/
+          cat Chart.lock
+          helm upgrade \
+          --install \
+          --wait \
+          --timeout 1800s \
+          --namespace ${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG }} \
+          --values values.yaml \
+          ${{ env.GITHUB_REF_SLUG }} \
+          --set labels.app="${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG }}" \
+          --set labels.ref="${{ env.GITHUB_REF_SLUG }}" \
+          --set image.repository=${{ env.REGISTRY }}/${{ env.GITHUB_REPOSITORY_NAME_PART_SLUG_URL }} \
+          --set image.tag=${{ env.GITHUB_REF_SLUG_URL }} \
+          --set env.appName="Op2date" \
+          --set env.appKey="${DEV_APP_KEY}" \
+          --set env.appUrl="https://${KUBE_REVIEW_URL}" \
+          --set env.logChannel="stdout" \
+          --set env.sessionDriver="file" \
+          --set env.cacheDriver="file" \
+          --set env.queueConnection="sync" \
+          --set mysql.db.password="${DB_PASSWORD}" \
+          --set mysql.root.password="${DB_ROOT_PASSWORD}" \
+          --set mysql.master.persistence.enabled=false \
+          --set mysql.master.persistence.size=3Gi \
+          --set redis.password="${REDIS_PASSWORD}" \
+          --set minio.persistence.enabled=false \
+          --set minio.accessKey.password=${MINIO_ACCESS_KEY_ID} \
+          --set minio.secretKey.password=${MINIO_SECRET_KEY_ID} \
+          --set ingress.enabled=true \
+          --set ingress.hosts[0].host="${KUBE_REVIEW_URL}" \
+          --set ingress.tls[0].hosts[0]="${KUBE_REVIEW_URL}" \
+          --set ingress.tls[0].secretName="${{ env.GITHUB_REF_SLUG_URL }}-isitech-tancou-fr-tls" \
+          --set podAnnotations.timestamp="t-$(date +%s)" \
+          .

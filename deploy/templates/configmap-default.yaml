@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "laravel.fullname" . }}-default
+  namespace: {{ .Release.Namespace }}
+  labels:
+    name: {{ template "laravel.name" . }}
+
+data:
+  APP_NAME: {{ .Values.env.appName | quote }}
+  {{- if .Values.env.production }}
+  APP_ENV: "production"
+  APP_DEBUG: "false"
+  {{- else }}
+  APP_ENV: "local"
+  APP_DEBUG: "true"
+  {{- end }}
+  APP_KEY: {{ .Values.env.appKey | quote }}
+  APP_URL: {{ .Values.env.appUrl | quote }}
+  REDIRECT_HTTPS: {{ .Values.env.redirectHttps | quote }}
+
+  LOG_CHANNEL: {{ .Values.env.logChannel | quote }}
+
+  DB_CONNECTION: "mysql"
+
+  BROADCAST_DRIVER: "log"
+  CACHE_DRIVER: {{ .Values.env.cacheDriver | quote }}
+  QUEUE_CONNECTION: {{ .Values.env.queueConnection | quote }}
+  SESSION_DRIVER: {{ .Values.env.sessionDriver | quote }}
+  SESSION_LIFETIME: "120"
+  REDIS_CLIENT: {{ .Values.env.redisClient | quote }}
+  REDIS_CLUSTER: {{ .Values.env.redisCluster | quote }}
+
+  MAIL_DRIVER: {{ .Values.env.mail.mailer | quote }}
+  MAIL_HOST: {{ .Values.env.mail.host | quote }}
+  MAIL_PORT: {{ .Values.env.mail.port | quote }}
+  MAIL_USERNAME: {{ .Values.env.mail.username | quote }}
+  MAIL_PASSWORD: {{ .Values.env.mail.password | quote }}
+  MAIL_ENCRYPTION: {{ .Values.env.mail.encryption | quote }}
+  MAIL_FROM_ADDRESS: {{ .Values.env.mail.fromAddress | quote }}
+  MAIL_FROM_NAME: {{ .Values.env.mail.fromName | quote }}
+
+  FILESYSTEM_DRIVER: {{ .Values.env.filesystemDriver | quote }}
+  FILESYSTEM_CLOUD: {{ .Values.env.filesystemCloud | quote }}
+  AWS_DEFAULT_REGION: {{ .Values.env.aws.defaultRegion | quote }}
+  AWS_BUCKET: {{ .Values.env.aws.bucket | quote }}
+  AWS_URL: {{ .Values.env.aws.url | quote }}
+  AWS_ENDPOINT: {{ include "laravel.minioUrl" . }}
+

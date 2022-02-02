@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+
+wait_for_service(){
+  until nc -vz $1 $2 > /dev/null; do
+    >&2 echo "$3 is unavailable - sleeping"
+    sleep 2
+  done
+  >&2 echo "$2 is up"
+}
+
+# Wait MYSQL
+wait_for_service "${DB_HOST}" "${DB_PORT}" "Mysql"
+
+# Wait Redis
+wait_for_service "${REDIS_HOST}" "${REDIS_PORT}" "Redis"
+
+# Wait Minio
+wait_for_service "${MINIO_HOST}" "${MINIO_PORT}" "Minio"
+
+dirs=( "/var/www/html/storage/app/public" "/var/www/html/storage/framework/cache" "/var/www/html/storage/framework/sessions" "/var/www/html/storage/framework/testing" "/var/www/html/storage/framework/views" "/var/www/html/storage/logs" )
+
+for i in "${dirs[@]}"; do
+    mkdir -p $i
+done
+
+if [ ! -z "$WWWUSER" ]; then
+    usermod -u $WWWUSER sail
+fi
+
+if [ ! -d /.composer ]; then
+    mkdir /.composer
+fi
+
+chmod -R ugo+rw /.composer
+
+if [ $# -gt 0 ]; then
+    exec gosu $WWWUSER "$@"
+else
+    cd /var/www/html/
+    env >> .env
+    sed -i "s~$(grep -e "APP_URL=" .env)~APP_URL=${APP_URL}~g" .env
+
+    chmod -R 777 storage
+    chown -R 1000:1000 storage
+
+    /usr/bin/php artisan clear-compiled
+    /usr/bin/php artisan view:cache
+    /usr/bin/php artisan route:cache
+    /usr/bin/php artisan config:cache
+
+    /usr/bin/php artisan migrate --force
+
+    /usr/bin/php artisan db:seed --force
+
+    /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
+fi
